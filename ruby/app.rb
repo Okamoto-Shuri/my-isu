@@ -3,9 +3,12 @@ require 'mysql2'
 require 'rack-flash'
 require 'shellwords'
 require 'rack/session/dalli'
+require 'connection_pool'
+require 'rack/deflater'
 
 module Isuconp
   class App < Sinatra::Base
+    use Rack::Deflater
     use Rack::Session::Dalli, autofix_keys: true, secret: ENV['ISUCONP_SESSION_SECRET'] || 'sendagaya', memcache_server: ENV['ISUCONP_MEMCACHED_ADDRESS'] || 'localhost:11211'
     use Rack::Flash
     set :public_folder, File.expand_path('../../public', __FILE__)
@@ -40,6 +43,8 @@ module Isuconp
           database: config[:db][:database],
           encoding: 'utf8mb4',
           reconnect: true,
+          pool_size: 20,
+          timeout: 5000,
         )
         client.query_options.merge!(symbolize_keys: true, database_timezone: :local, application_timezone: :local)
         Thread.current[:isuconp_db] = client
@@ -91,44 +96,88 @@ module Isuconp
 
       def get_session_user()
         if session[:user]
-          db.prepare('SELECT * FROM `users` WHERE `id` = ?').execute(
-            session[:user][:id]
-          ).first
+          # Cache user data in session to avoid repeated DB queries
+          if session[:user_data]
+            session[:user_data]
+          else
+            user_data = db.prepare('SELECT * FROM `users` WHERE `id` = ?').execute(
+              session[:user][:id]
+            ).first
+            session[:user_data] = user_data
+            user_data
+          end
         else
           nil
         end
       end
 
       def make_posts(results, all_comments: false)
-        posts = []
-        results.to_a.each do |post|
-          post[:comment_count] = db.prepare('SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?').execute(
-            post[:id]
-          ).first[:count]
-
-          query = 'SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC'
-          unless all_comments
-            query += ' LIMIT 3'
+        posts = results.to_a
+        return [] if posts.empty?
+        
+        post_ids = posts.map { |post| post[:id] }
+        user_ids = posts.map { |post| post[:user_id] }
+        
+        # Batch load comment counts
+        comment_counts = {}
+        if post_ids.any?
+          placeholder = (['?'] * post_ids.length).join(',')
+          db.prepare("SELECT post_id, COUNT(*) AS count FROM comments WHERE post_id IN (#{placeholder}) GROUP BY post_id").execute(*post_ids).each do |row|
+            comment_counts[row[:post_id]] = row[:count]
           end
-          comments = db.prepare(query).execute(
-            post[:id]
-          ).to_a
+        end
+        
+        # Batch load comments
+        comments_by_post = {}
+        if post_ids.any?
+          placeholder = (['?'] * post_ids.length).join(',')
+          limit_clause = all_comments ? '' : ' LIMIT 3'
+          query = "SELECT * FROM comments WHERE post_id IN (#{placeholder}) ORDER BY created_at DESC#{limit_clause}"
+          db.prepare(query).execute(*post_ids).each do |comment|
+            comments_by_post[comment[:post_id]] ||= []
+            comments_by_post[comment[:post_id]] << comment
+          end
+        end
+        
+        # Batch load comment users
+        comment_user_ids = comments_by_post.values.flatten.map { |comment| comment[:user_id] }.uniq
+        comment_users = {}
+        if comment_user_ids.any?
+          placeholder = (['?'] * comment_user_ids.length).join(',')
+          db.prepare("SELECT * FROM users WHERE id IN (#{placeholder})").execute(*comment_user_ids).each do |user|
+            comment_users[user[:id]] = user
+          end
+        end
+        
+        # Batch load post users
+        post_users = {}
+        if user_ids.any?
+          placeholder = (['?'] * user_ids.length).join(',')
+          db.prepare("SELECT * FROM users WHERE id IN (#{placeholder})").execute(*user_ids).each do |user|
+            post_users[user[:id]] = user
+          end
+        end
+        
+        # Build final posts array
+        final_posts = []
+        posts.each do |post|
+          post[:comment_count] = comment_counts[post[:id]] || 0
+          
+          comments = comments_by_post[post[:id]] || []
           comments.each do |comment|
-            comment[:user] = db.prepare('SELECT * FROM `users` WHERE `id` = ?').execute(
-              comment[:user_id]
-            ).first
+            comment[:user] = comment_users[comment[:user_id]]
           end
           post[:comments] = comments.reverse
-
-          post[:user] = db.prepare('SELECT * FROM `users` WHERE `id` = ?').execute(
-            post[:user_id]
-          ).first
-
-          posts.push(post) if post[:user][:del_flg] == 0
-          break if posts.length >= POSTS_PER_PAGE
+          
+          post[:user] = post_users[post[:user_id]]
+          
+          if post[:user] && post[:user][:del_flg] == 0
+            final_posts.push(post)
+            break if final_posts.length >= POSTS_PER_PAGE
+          end
         end
-
-        posts
+        
+        final_posts
       end
 
       def image_url(post)
@@ -147,6 +196,18 @@ module Isuconp
 
     get '/initialize' do
       db_initialize
+      
+      # Add database indexes for performance
+      db.query('CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at)')
+      db.query('CREATE INDEX IF NOT EXISTS idx_posts_user_id ON posts(user_id)')
+      db.query('CREATE INDEX IF NOT EXISTS idx_posts_user_created ON posts(user_id, created_at)')
+      db.query('CREATE INDEX IF NOT EXISTS idx_comments_post_id ON comments(post_id)')
+      db.query('CREATE INDEX IF NOT EXISTS idx_comments_user_id ON comments(user_id)')
+      db.query('CREATE INDEX IF NOT EXISTS idx_comments_post_created ON comments(post_id, created_at)')
+      db.query('CREATE INDEX IF NOT EXISTS idx_users_account_name ON users(account_name)')
+      db.query('CREATE INDEX IF NOT EXISTS idx_users_del_flg ON users(del_flg)')
+      db.query('CREATE INDEX IF NOT EXISTS idx_users_authority_del ON users(authority, del_flg)')
+      
       return 200
     end
 
@@ -219,13 +280,14 @@ module Isuconp
 
     get '/logout' do
       session.delete(:user)
+      session.delete(:user_data)
       redirect '/', 302
     end
 
     get '/' do
       me = get_session_user()
 
-      results = db.query('SELECT `id`, `user_id`, `body`, `created_at`, `mime` FROM `posts` ORDER BY `created_at` DESC')
+      results = db.query('SELECT `id`, `user_id`, `body`, `created_at`, `mime` FROM `posts` ORDER BY `created_at` DESC LIMIT 20')
       posts = make_posts(results)
 
       erb :index, layout: :layout, locals: { posts: posts, me: me }
@@ -240,27 +302,24 @@ module Isuconp
         return 404
       end
 
-      results = db.prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC').execute(
+      results = db.prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT 20').execute(
         user[:id]
       )
       posts = make_posts(results)
 
-      comment_count = db.prepare('SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?').execute(
-        user[:id]
-      ).first[:count]
-
-      post_ids = db.prepare('SELECT `id` FROM `posts` WHERE `user_id` = ?').execute(
-        user[:id]
-      ).map{|post| post[:id]}
-      post_count = post_ids.length
-
-      commented_count = 0
-      if post_count > 0
-        placeholder = (['?'] * post_ids.length).join(",")
-        commented_count = db.prepare("SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN (#{placeholder})").execute(
-          *post_ids
-        ).first[:count]
-      end
+      # Optimize user statistics with single query
+      stats = db.prepare('
+        SELECT 
+          (SELECT COUNT(*) FROM comments WHERE user_id = ?) as comment_count,
+          (SELECT COUNT(*) FROM posts WHERE user_id = ?) as post_count,
+          (SELECT COUNT(*) FROM comments c 
+           INNER JOIN posts p ON c.post_id = p.id 
+           WHERE p.user_id = ?) as commented_count
+      ').execute(user[:id], user[:id], user[:id]).first
+      
+      comment_count = stats[:comment_count]
+      post_count = stats[:post_count]
+      commented_count = stats[:commented_count]
 
       me = get_session_user()
 
@@ -269,7 +328,7 @@ module Isuconp
 
     get '/posts' do
       max_created_at = params['max_created_at']
-      results = db.prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC').execute(
+      results = db.prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT 20').execute(
         max_created_at.nil? ? nil : Time.iso8601(max_created_at).localtime
       )
       posts = make_posts(results)
@@ -350,6 +409,8 @@ module Isuconp
           (params[:ext] == "png" && post[:mime] == "image/png") ||
           (params[:ext] == "gif" && post[:mime] == "image/gif")
         headers['Content-Type'] = post[:mime]
+        headers['Cache-Control'] = 'public, max-age=3600'
+        headers['ETag'] = "\"#{post[:id]}-#{post[:created_at].to_i}\""
         return post[:imgdata]
       end
 
@@ -393,7 +454,7 @@ module Isuconp
         return 403
       end
 
-      users = db.query('SELECT * FROM `users` WHERE `authority` = 0 AND `del_flg` = 0 ORDER BY `created_at` DESC')
+      users = db.query('SELECT * FROM `users` WHERE `authority` = 0 AND `del_flg` = 0 ORDER BY `created_at` DESC LIMIT 100')
 
       erb :banned, layout: :layout, locals: { users: users, me: me }
     end
