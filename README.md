@@ -1,4 +1,4 @@
-# READMW
+# README
 
 ## 変更前のscoreの数値
 docker run --network host -i private-isu-benchmarker /bin/benchmarker -t http://host.docker.internal -u /opt/userdata
